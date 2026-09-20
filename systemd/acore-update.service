@@ -1,0 +1,19 @@
+[Unit]
+Description=AzerothCore + modules unattended update
+Documentation=https://github.com/marrenia/azerothcore-updater
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/acore-update
+# A cold-ccache full rebuild can legitimately run for hours. systemd's default
+# would kill it mid-compile, leaving source updated but binaries stale - the
+# one state the script otherwise cannot reach.
+TimeoutStartSec=6h
+# The script does its own rollback; a non-zero exit is information, not
+# something systemd should "fix" by restarting.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,67 @@
+# acore-update configuration - EVERYTHING HERE IS OPTIONAL.
+#
+# Run `acore-update detect` first: anything it finds correctly needs no entry
+# here. Only set what detection gets wrong or cannot know.
+#
+# Install to /etc/acore-update.conf (or set ACORE_UPDATE_CONF).
+
+# ---- paths ----------------------------------------------------------------
+# Detected by looking for a git checkout with CMakeLists.txt and src/server in
+# the usual places (/home/*/azerothcore, /opt/azerothcore, ...).
+#ACORE_SRC=/home/acore/azerothcore
+# Detected as the directory containing CMakeCache.txt.
+#ACORE_BUILD=/home/acore/azerothcore/build
+# Read from CMAKE_INSTALL_PREFIX in CMakeCache.txt - almost never needs setting.
+#ACORE_PREFIX=/home/acore/server
+# Where worldserver.conf lives. Used only for the database backup and to find
+# the world port; if unset and undetectable, DB backup is skipped with a warning.
+#ACORE_CONF_DIR=/home/acore/server/etc
+# Defaults to the owner of the source tree.
+#ACORE_USER=acore
+
+# ---- how your server is started and stopped -------------------------------
+# systemd unit names are detected by trying acore-worldserver, worldserver,
+# azerothcore-worldserver, ac-worldserver (likewise for authserver).
+#ACORE_WORLD_SVC=acore-worldserver
+#ACORE_AUTH_SVC=acore-authserver
+#
+# NOT using systemd? Set these instead and the unit names are ignored entirely.
+# They are eval'd, so anything goes: docker, tmux, screen, supervisor, runit.
+#
+#   docker compose:
+#ACORE_STOP_CMD="docker compose -f /opt/acore/docker-compose.yml stop worldserver authserver"
+#ACORE_START_CMD="docker compose -f /opt/acore/docker-compose.yml start authserver worldserver"
+#
+#   tmux:
+#ACORE_STOP_CMD="tmux send-keys -t world 'server shutdown 1' Enter; sleep 20"
+#ACORE_START_CMD="tmux new-session -d -s world '/home/acore/server/bin/worldserver'"
+
+# ---- health --------------------------------------------------------------
+# Default probe is a TCP connect to the world port (read from worldserver.conf,
+# else 8085). Override if you have something better - exit 0 means healthy.
+#ACORE_HEALTH_CMD="curl -fsS --max-time 5 http://127.0.0.1:8090/healthz | grep -q '\"worldserver\":\"up\"'"
+#ACORE_WORLD_PORT=8085
+# How long to wait for the realm to come back before rolling back (seconds).
+#ACORE_HEALTH_TIMEOUT=600
+
+# ---- build ---------------------------------------------------------------
+# Defaults to nproc. Lower it if the build competes with a live realm: each
+# playerbots translation unit can want well over 1GB.
+#ACORE_JOBS=2
+# Cap the build's memory via a systemd scope, so under pressure the kernel
+# kills the compiler instead of your worldserver. Empty = uncapped.
+#ACORE_MEM_MAX=5G
+#ACORE_MIN_FREE_MB=1500
+#ACORE_MIN_DISK_MB=10000
+# auto = use ccache when installed. 1 = require, 0 = never.
+#ACORE_USE_CCACHE=auto
+# Extra cmake flags, only needed on first configure of an unusual build.
+#ACORE_CMAKE_ARGS="-DTOOLS_BUILD=none"
+
+# ---- backups and state ----------------------------------------------------
+# Database credentials are read from worldserver.conf; nothing to configure.
+#ACORE_BACKUP_DB=1
+#ACORE_BACKUP_DIR=/var/backups/acore-update
+#ACORE_BACKUP_KEEP=5
+#ACORE_PATCH_DIR=/etc/acore-update/patches
+#ACORE_STATE_DIR=/var/lib/acore-update

@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily AzerothCore update
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+RandomizedDelaySec=10m
+# Deliberately OFF. Catching up a missed run means rebuilding and restarting
+# the realm at an arbitrary moment after boot, which is exactly the surprise a
+# fixed quiet-hours slot exists to avoid. A skipped day is harmless.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

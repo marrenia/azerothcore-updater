@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+#
+# acore-update - unattended AzerothCore + module updater.
+#
+# Fetches every tracked repository (core and each module), fast-forwards them,
+# re-applies your local patch series, rebuilds, reinstalls, restarts the realm,
+# and rolls the binaries back automatically if it does not come back healthy.
+#
+# It is built to work against an AzerothCore install it knows nothing about:
+# almost everything is auto-detected, and anything that cannot be is a single
+# config value. Run `acore-update detect` to see exactly what it found.
+#
+# Two design decisions are load-bearing and should not be "simplified":
+#
+#   1. Patches are applied with `git apply` into the WORKING TREE, never
+#      `git am`. Commits would move HEAD off the upstream branch and the next
+#      run's `git merge --ff-only` would refuse - silently turning a patched
+#      server into one that never updates again.
+#
+#   2. The database dump is taken AFTER the build, immediately before the
+#      restart. AzerothCore applies SQL migrations on worldserver start, so a
+#      dump taken before a long compile is already stale as a restore point.
+#
+# Exit codes: 0 = nothing to do or success
+#             1 = failed, realm still healthy
+#             2 = failed AND realm is down - needs a human
+#
+set -Eeuo pipefail
+
+VERSION=1.0.0
+SELF="$(basename "$0")"
+
+# --------------------------------------------------------------- config load
+# Precedence: environment > config file > auto-detection.
+CONF="${ACORE_UPDATE_CONF:-}"
+if [[ -z "$CONF" ]]; then
+    for c in /etc/acore-update.conf /usr/local/etc/acore-update.conf \
+             "$(dirname "$(readlink -f "$0")")/acore-update.conf"; do
+        [[ -r "$c" ]] && { CONF="$c"; break; }
+    done
+fi
+# shellcheck disable=SC1090
+[[ -n "$CONF" && -r "$CONF" ]] && . "$CONF"
+
+log()  { printf '%s %s: %s\n' "$(date -u +%H:%M:%S)" "$SELF" "$*"; }
+die()  { log "FATAL: $*"; exit 1; }
+warn() { log "warning: $*"; }
+
+# --------------------------------------------------------------- autodetect
+# Source tree: the git checkout containing AzerothCore's own CMakeLists.
+detect_src() {
+    local c
+    for c in "${ACORE_SRC:-}" /home/*/azerothcore /home/*/azerothcore-wotlk \
+             /opt/azerothcore /opt/azerothcore-wotlk /srv/azerothcore \
+             "$PWD" "$PWD/.."; do
+        [[ -n "$c" && -d "$c/.git" && -f "$c/CMakeLists.txt" && -d "$c/src/server" ]] \
+            && { readlink -f "$c"; return 0; }
+    done
+    return 1
+}
+
+# Build dir: wherever CMakeCache.txt lives. Out-of-tree builds are common.
+detect_build() {
+    local s="$1" c
+    for c in "${ACORE_BUILD:-}" "$s/build" "$s/../build" "$s/cmake-build" /opt/azerothcore-build; do
+        [[ -n "$c" && -f "$c/CMakeCache.txt" ]] && { readlink -f "$c"; return 0; }
+    done
+    return 1
+}
+
+# Install prefix: authoritative value straight out of the build cache, so it is
+# correct no matter where the admin chose to install.
+detect_prefix() {
+    local b="$1" p
+    p="$(grep -m1 '^CMAKE_INSTALL_PREFIX:' "$b/CMakeCache.txt" 2>/dev/null | cut -d= -f2-)"
+    [[ -n "$p" && -d "$p" ]] && { echo "$p"; return 0; }
+    return 1
+}
+
+detect_user() { stat -c %U "$1"; }
+
+# Server config dir: where worldserver.conf actually is.
+detect_confdir() {
+    local p="$1" c
+    for c in "${ACORE_CONF_DIR:-}" "$p/etc" "$p/conf" /etc/azerothcore; do
+        [[ -n "$c" && -f "$c/worldserver.conf" ]] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+# Service manager. Only systemd is auto-detected; anything else is explicit
+# start/stop commands, which covers docker, tmux, screen, supervisor, runit...
+detect_service() {
+    local want="$1" u
+    for u in "acore-$want" "$want" "azerothcore-$want" "ac-$want"; do
+        systemctl list-unit-files --no-legend "$u.service" 2>/dev/null | grep -q . && { echo "$u"; return 0; }
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------ resolve
+command -v git >/dev/null || die "git is required"
+
+ACORE_SRC="${ACORE_SRC:-$(detect_src || true)}"
+[[ -n "$ACORE_SRC" ]] || die "cannot find the AzerothCore source tree - set ACORE_SRC in ${CONF:-/etc/acore-update.conf}"
+ACORE_BUILD="${ACORE_BUILD:-$(detect_build "$ACORE_SRC" || true)}"
+[[ -n "$ACORE_BUILD" ]] || die "cannot find a build directory with CMakeCache.txt - set ACORE_BUILD"
+ACORE_PREFIX="${ACORE_PREFIX:-$(detect_prefix "$ACORE_BUILD" || true)}"
+[[ -n "$ACORE_PREFIX" ]] || die "cannot read CMAKE_INSTALL_PREFIX from $ACORE_BUILD/CMakeCache.txt - set ACORE_PREFIX"
+ACORE_USER="${ACORE_USER:-$(detect_user "$ACORE_SRC")}"
+ACORE_CONF_DIR="${ACORE_CONF_DIR:-$(detect_confdir "$ACORE_PREFIX" || true)}"
+
+ACORE_WORLD_SVC="${ACORE_WORLD_SVC:-$(detect_service worldserver || true)}"
+ACORE_AUTH_SVC="${ACORE_AUTH_SVC:-$(detect_service authserver || true)}"
+ACORE_START_CMD="${ACORE_START_CMD:-}"     # overrides systemd entirely
+ACORE_STOP_CMD="${ACORE_STOP_CMD:-}"
+
+ACORE_STATE_DIR="${ACORE_STATE_DIR:-/var/lib/acore-update}"
+ACORE_BACKUP_DIR="${ACORE_BACKUP_DIR:-/var/backups/acore-update}"
+ACORE_PATCH_DIR="${ACORE_PATCH_DIR:-/etc/acore-update/patches}"
+ACORE_LOCK="${ACORE_LOCK:-/var/lock/acore-update.lock}"
+
+ACORE_JOBS="${ACORE_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+ACORE_MEM_MAX="${ACORE_MEM_MAX:-}"          # e.g. 5G; empty = uncapped
+ACORE_MIN_FREE_MB="${ACORE_MIN_FREE_MB:-1500}"
+ACORE_MIN_DISK_MB="${ACORE_MIN_DISK_MB:-10000}"
+ACORE_HEALTH_TIMEOUT="${ACORE_HEALTH_TIMEOUT:-600}"
+ACORE_HEALTH_CMD="${ACORE_HEALTH_CMD:-}"    # custom probe; exit 0 = healthy
+ACORE_WORLD_PORT="${ACORE_WORLD_PORT:-}"    # auto-read from worldserver.conf
+ACORE_BACKUP_DB="${ACORE_BACKUP_DB:-1}"
+ACORE_BACKUP_KEEP="${ACORE_BACKUP_KEEP:-5}"
+ACORE_CMAKE_ARGS="${ACORE_CMAKE_ARGS:-}"
+ACORE_USE_CCACHE="${ACORE_USE_CCACHE:-auto}"
+
+DRY_RUN="${ACORE_UPDATE_DRY_RUN:-0}"
+FORCE="${ACORE_UPDATE_FORCE:-0}"
+
+STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+STATUS_FILE="$ACORE_STATE_DIR/last-run.json"
+PATCH_HASH_FILE="$ACORE_STATE_DIR/last-patchset.sha256"
+PATCHES_APPLIED=0
+PHASE=start; RESULT=unknown; DETAIL=""; UPDATED=""
+
+as_srv() {
+    if [[ "$(id -un)" == "$ACORE_USER" ]]; then
+        env HOME="$(getent passwd "$ACORE_USER" | cut -d: -f6)" "$@"
+    else
+        runuser -u "$ACORE_USER" -- \
+            env HOME="$(getent passwd "$ACORE_USER" | cut -d: -f6)" "$@"
+    fi
+}
+
+# --------------------------------------------------------------- repositories
+# Auto-discovered, not hardcoded: the core plus every module that is its own
+# git checkout. Each is tracked on whatever branch it is already on, so a
+# playerbots fork on "Playerbot" and a stock install on "master" both work
+# with no configuration at all.
+discover_repos() {
+    echo "$ACORE_SRC"
+    local d
+    for d in "$ACORE_SRC"/modules/*/; do
+        [[ -d "$d/.git" ]] && readlink -f "$d"
+    done
+}
+repo_branch() { as_srv git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null; }
+repo_key()    { [[ "$1" == "$ACORE_SRC" ]] && echo core || basename "$1"; }
+
+# -------------------------------------------------------------------- service
+svc_stop() {
+    if [[ -n "$ACORE_STOP_CMD" ]]; then eval "$ACORE_STOP_CMD"; return; fi
+    [[ -n "$ACORE_WORLD_SVC" ]] && systemctl stop "$ACORE_WORLD_SVC"
+    [[ -n "$ACORE_AUTH_SVC"  ]] && systemctl stop "$ACORE_AUTH_SVC"
+    return 0
+}
+svc_start() {
+    if [[ -n "$ACORE_START_CMD" ]]; then eval "$ACORE_START_CMD"; return; fi
+    [[ -n "$ACORE_AUTH_SVC"  ]] && systemctl start "$ACORE_AUTH_SVC"
+    [[ -n "$ACORE_WORLD_SVC" ]] && systemctl start "$ACORE_WORLD_SVC"
+    return 0
+}
+
+world_port() {
+    [[ -n "$ACORE_WORLD_PORT" ]] && { echo "$ACORE_WORLD_PORT"; return; }
+    local p=""
+    [[ -n "$ACORE_CONF_DIR" ]] && p="$(grep -m1 -E '^\s*WorldServerPort' \
+        "$ACORE_CONF_DIR/worldserver.conf" 2>/dev/null | tr -d ' ' | cut -d= -f2)"
+    echo "${p:-8085}"
+}
+
+# Health, in order of how much it actually proves:
+#   1. a custom probe, if the admin configured one
+#   2. the world port accepting TCP - proves it serves game clients
+#   3. the service being "active" - weakest, but better than nothing
+healthy() {
+    if [[ -n "$ACORE_HEALTH_CMD" ]]; then eval "$ACORE_HEALTH_CMD" >/dev/null 2>&1; return; fi
+    local port; port="$(world_port)"
+    if command -v timeout >/dev/null; then
+        timeout 4 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null && return 0
+    fi
+    [[ -n "$ACORE_WORLD_SVC" ]] && systemctl is-active --quiet "$ACORE_WORLD_SVC" && return 0
+    return 1
+}
+wait_healthy() {
+    local deadline=$((SECONDS + ACORE_HEALTH_TIMEOUT))
+    while (( SECONDS < deadline )); do healthy && return 0; sleep 10; done
+    return 1
+}
+
+# --------------------------------------------------------------------- backup
+# Reads credentials out of worldserver.conf rather than needing its own copy.
+# Values are never echoed; the password goes to mysqldump via MYSQL_PWD.
+backup_databases() {
+    [[ "$ACORE_BACKUP_DB" == "1" ]] || { log "database backup disabled"; return 0; }
+    command -v mysqldump >/dev/null || { warn "mysqldump not found - skipping database backup"; return 0; }
+    [[ -n "$ACORE_CONF_DIR" ]] || { warn "no config dir found - skipping database backup"; return 0; }
+
+    local conf="$ACORE_CONF_DIR/worldserver.conf" line info host port user pass db n=0
+    mkdir -p "$ACORE_BACKUP_DIR"; chmod 700 "$ACORE_BACKUP_DIR"
+    umask 077
+    while read -r line; do
+        info="$(sed -E 's/.*=\s*"?([^"]*)"?\s*$/\1/' <<<"$line")"
+        IFS=';' read -r host port user pass db <<<"$info"
+        [[ -n "${db:-}" ]] || continue
+        log "dumping $db"
+        if MYSQL_PWD="$pass" mysqldump --single-transaction --quick --routines \
+              --triggers --events -h "${host:-127.0.0.1}" -P "${port:-3306}" \
+              -u "$user" "$db" 2>/dev/null | gzip > "$ACORE_BACKUP_DIR/$db-$STAMP.sql.gz"; then
+            gzip -t "$ACORE_BACKUP_DIR/$db-$STAMP.sql.gz" || die "dump of $db is corrupt"
+            n=$((n+1))
+        else
+            die "mysqldump failed for $db - refusing to install"
+        fi
+    done < <(grep -hE '^\s*(Login|World|Character)DatabaseInfo\s*=' "$conf" 2>/dev/null)
+    log "backed up $n database(s) to $ACORE_BACKUP_DIR"
+}
+
+# --------------------------------------------------------------------- patches
+patches_for() {
+    local d="$ACORE_PATCH_DIR/$(repo_key "$1")"
+    [[ -d "$d" ]] || return 0
+    find "$d" -maxdepth 1 -name '*.patch' -type f | sort
+}
+patchset_hash() {
+    if [[ -d "$ACORE_PATCH_DIR" ]] && find "$ACORE_PATCH_DIR" -name '*.patch' -type f -print -quit | grep -q .; then
+        find "$ACORE_PATCH_DIR" -name '*.patch' -type f -print0 | sort -z | xargs -0 cat | sha256sum | cut -d' ' -f1
+    else
+        echo none
+    fi
+}
+# `git clean` without -x on purpose: gitignored content such as
+# data/sql/custom/ is the admin's, and must survive every update.
+clean_tree() { as_srv git -C "$1" reset --hard --quiet HEAD; as_srv git -C "$1" clean -fdq; }
+
+apply_patches() {
+    local path="$1" list applied=0; list="$(patches_for "$path")"
+    [[ -n "$list" ]] || return 0
+    while IFS= read -r p; do
+        as_srv git -C "$path" apply --check "$p" \
+            || die "patch no longer applies to $(repo_key "$path"): $(basename "$p") - upstream changed that code, rebase it by hand"
+    done <<< "$list"
+    while IFS= read -r p; do
+        as_srv git -C "$path" apply "$p" || die "patch failed mid-series: $(basename "$p")"
+        applied=$((applied+1))
+    done <<< "$list"
+    log "$(repo_key "$path"): applied $applied patch(es)"
+    PATCHES_APPLIED=$((PATCHES_APPLIED + applied))
+}
+
+# ---------------------------------------------------------------- subcommands
+cmd_detect() {
+    cat <<EOF
+$SELF $VERSION - detected configuration
+  config file     : ${CONF:-<none, using autodetection>}
+  source tree     : $ACORE_SRC
+  build dir       : $ACORE_BUILD
+  install prefix  : $ACORE_PREFIX
+  server config   : ${ACORE_CONF_DIR:-<not found - DB backup will be skipped>}
+  runs as user    : $ACORE_USER
+  world service   : ${ACORE_WORLD_SVC:-<none>}
+  auth service    : ${ACORE_AUTH_SVC:-<none>}
+  custom start    : ${ACORE_START_CMD:-<systemd>}
+  custom stop     : ${ACORE_STOP_CMD:-<systemd>}
+  health probe    : ${ACORE_HEALTH_CMD:-<tcp 127.0.0.1:$(world_port)>}
+  build jobs      : $ACORE_JOBS
+  build mem cap   : ${ACORE_MEM_MAX:-<uncapped>}
+  patch dir       : $ACORE_PATCH_DIR
+  backup dir      : $ACORE_BACKUP_DIR  (db backup: $ACORE_BACKUP_DB)
+  state dir       : $ACORE_STATE_DIR
+
+repositories discovered:
+EOF
+    local r; while read -r r; do
+        printf '  %-18s %-12s %s\n' "$(repo_key "$r")" "$(repo_branch "$r")" "$r"
+    done < <(discover_repos)
+    echo
+    echo -n "health right now: "; healthy && echo "OK" || echo "NOT HEALTHY"
+}
+
+cmd_help() {
+    cat <<EOF
+$SELF $VERSION - unattended AzerothCore updater
+
+  $SELF              update if anything changed
+  $SELF --force      rebuild even if nothing changed
+  $SELF --dry-run    report what would happen, change nothing
+  $SELF detect       show detected paths, repos and health, then exit
+  $SELF --version
+
+Configuration is optional; see acore-update.conf.example. Everything that can
+be detected is detected - run '$SELF detect' first on a new install.
+EOF
+}
+
+case "${1:-}" in
+    detect)            cmd_detect; exit 0 ;;
+    -h|--help|help)    cmd_help;   exit 0 ;;
+    --version)         echo "$VERSION"; exit 0 ;;
+    --dry-run)         DRY_RUN=1 ;;
+    --force)           FORCE=1 ;;
+    "")                ;;
+    *)                 die "unknown argument: $1 (try --help)" ;;
+esac
+
+# ------------------------------------------------------------------- plumbing
+write_status() {
+    mkdir -p "$ACORE_STATE_DIR"
+    local esc; esc="$(printf '%s' "${DETAIL:-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
+    cat > "$STATUS_FILE" <<EOF
+{
+  "stamp": "$STAMP",
+  "finished": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "result": "$RESULT",
+  "phase": "$PHASE",
+  "updated": "$UPDATED",
+  "patches_applied": ${PATCHES_APPLIED:-0},
+  "detail": "$esc",
+  "realm_healthy": $(healthy && echo true || echo false)
+}
+EOF
+    chmod 644 "$STATUS_FILE"
+}
+on_exit() {
+    local rc=$?
+    [[ "$RESULT" == unknown ]] && RESULT=$([[ $rc -eq 0 ]] && echo success || echo failed)
+    write_status || true
+    log "done (result=$RESULT phase=$PHASE rc=$rc)"
+}
+trap on_exit EXIT
+
+# ------------------------------------------------------------------ preflight
+PHASE=preflight
+[[ $EUID -eq 0 ]] || die "must run as root (it stops services and writes to $ACORE_STATE_DIR)"
+mkdir -p "$(dirname "$ACORE_LOCK")" "$ACORE_STATE_DIR"
+exec 9>"$ACORE_LOCK"; flock -n 9 || die "another run holds the lock"
+
+disk_mb=$(df --output=avail -m "$ACORE_BUILD" | tail -1 | tr -d ' ')
+(( disk_mb >= ACORE_MIN_DISK_MB )) || die "only ${disk_mb}MB free on the build filesystem, need ${ACORE_MIN_DISK_MB}MB"
+
+# Never update an already-broken realm: our breakage would be indistinguishable
+# from the pre-existing kind, and "rollback" would restore something dead.
+if ! healthy; then
+    RESULT=skipped; DETAIL="realm was already unhealthy before the update; refusing to touch it"
+    log "$DETAIL"; exit 1
+fi
+log "preflight ok (${disk_mb}MB free, jobs=$ACORE_JOBS, mem cap=${ACORE_MEM_MAX:-none})"
+
+# --------------------------------------------------------------------- detect
+PHASE=detect
+declare -A OLD_SHA
+changed=0; summary=""
+mapfile -t REPOS < <(discover_repos)
+log "tracking ${#REPOS[@]} repositories"
+
+for path in "${REPOS[@]}"; do
+    name="$(repo_key "$path")"
+    branch="$(repo_branch "$path")"
+    [[ -n "$branch" && "$branch" != HEAD ]] || { warn "$name is in detached HEAD - skipping"; continue; }
+
+    clean_tree "$path"
+
+    # depth-1 clones have no usable merge-base, which makes "commits behind"
+    # report the entire upstream history. Deepen once, then it is meaningful.
+    if [[ "$(as_srv git -C "$path" rev-parse --is-shallow-repository)" == "true" ]]; then
+        log "$name: deepening shallow clone (one-off)"
+        as_srv git -C "$path" fetch --unshallow --quiet origin "$branch" \
+            || as_srv git -C "$path" fetch --quiet origin "$branch" || die "unshallow failed for $name"
+    fi
+    as_srv git -C "$path" fetch --quiet origin "$branch" || die "fetch failed for $name"
+
+    old="$(as_srv git -C "$path" rev-parse HEAD)"
+    new="$(as_srv git -C "$path" rev-parse "origin/$branch")"
+    OLD_SHA[$path]="$old"
+    [[ "$old" == "$new" ]] && { log "$name [$branch]: up to date"; continue; }
+
+    base="$(as_srv git -C "$path" merge-base HEAD "origin/$branch")"
+    [[ "$base" == "$old" ]] || die "$name: upstream is not a fast-forward (history rewritten) - resolve by hand"
+
+    n="$(as_srv git -C "$path" rev-list --count "HEAD..origin/$branch")"
+    log "$name [$branch]: $n new commit(s) ${old:0:9} -> ${new:0:9}"
+    summary+="$name ${old:0:9}->${new:0:9} ($n); "
+    changed=1
+done
+
+# A changed patch set is itself a reason to rebuild, or a patch added today
+# would sit unbuilt until upstream happened to move.
+PATCH_HASH="$(patchset_hash)"
+LAST_PATCH_HASH="$(cat "$PATCH_HASH_FILE" 2>/dev/null || echo none)"
+if [[ "$PATCH_HASH" != "$LAST_PATCH_HASH" ]]; then
+    log "patch set changed (${LAST_PATCH_HASH:0:12} -> ${PATCH_HASH:0:12})"
+    summary+="patchset ${LAST_PATCH_HASH:0:9}->${PATCH_HASH:0:9}; "; changed=1
+fi
+if (( FORCE )) && (( ! changed )); then
+    log "nothing changed, but --force given"; summary+="forced; "; changed=1
+fi
+if (( ! changed )); then RESULT=noop; DETAIL="already up to date"; log "nothing to do"; exit 0; fi
+UPDATED="$summary"
+if [[ "$DRY_RUN" == 1 ]]; then RESULT=dryrun; DETAIL="$summary"; log "DRY RUN - stopping before any change"; exit 0; fi
+
+# --------------------------------------------------------------------- source
+PHASE=source
+rollback_source() {
+    for p in "${REPOS[@]}"; do
+        [[ -n "${OLD_SHA[$p]:-}" ]] && as_srv git -C "$p" reset --hard "${OLD_SHA[$p]}" --quiet || true
+    done
+    log "source rolled back"
+}
+for path in "${REPOS[@]}"; do
+    branch="$(repo_branch "$path")"; [[ -n "$branch" && "$branch" != HEAD ]] || continue
+    as_srv git -C "$path" merge --ff-only "origin/$branch" --quiet \
+        || { rollback_source; die "fast-forward failed for $(repo_key "$path")"; }
+done
+log "source updated"
+
+PHASE=patch
+for path in "${REPOS[@]}"; do apply_patches "$path"; done
+(( PATCHES_APPLIED )) || log "no local patches"
+
+# ---------------------------------------------------------------------- build
+PHASE=build
+free_mb=$(free -m | awk '/^Mem:/ {print $7}')
+(( free_mb >= ACORE_MIN_FREE_MB )) || { rollback_source; die "only ${free_mb}MB available memory, need ${ACORE_MIN_FREE_MB}MB"; }
+
+CMAKE_EXTRA=()
+if [[ "$ACORE_USE_CCACHE" == "1" ]] || { [[ "$ACORE_USE_CCACHE" == auto ]] && command -v ccache >/dev/null; }; then
+    CMAKE_EXTRA+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+fi
+# Reconfigure in place. Existing cache values are preserved by cmake, so this
+# does not disturb however the admin originally configured the build.
+log "configuring"
+# shellcheck disable=SC2086
+as_srv cmake -S "$ACORE_SRC" -B "$ACORE_BUILD" "${CMAKE_EXTRA[@]}" $ACORE_CMAKE_ARGS >/dev/null \
+    || { rollback_source; die "cmake configure failed"; }
+
+log "building with -j$ACORE_JOBS (realm stays up)"
+build_start=$SECONDS
+SRV_HOME="$(getent passwd "$ACORE_USER" | cut -d: -f6)"
+run_build() {
+    if [[ -n "$ACORE_MEM_MAX" ]] && command -v systemd-run >/dev/null; then
+        # Cap the build so that under memory pressure the kernel kills the
+        # compiler and never the running game server.
+        systemd-run --scope --quiet --collect --unit="acore-build-$$" \
+            -p MemoryMax="$ACORE_MEM_MAX" -p CPUWeight=20 -p IOWeight=20 \
+            -- nice -n 10 ionice -c 3 runuser -u "$ACORE_USER" -- \
+               env HOME="$SRV_HOME" cmake --build "$ACORE_BUILD" -- -j"$ACORE_JOBS"
+    else
+        # nice/ionice cannot invoke a shell function, so spell out runuser.
+        nice -n 10 ionice -c 3 runuser -u "$ACORE_USER" -- \
+            env HOME="$SRV_HOME" cmake --build "$ACORE_BUILD" -- -j"$ACORE_JOBS"
+    fi
+}
+if ! run_build; then
+    rollback_source
+    RESULT=failed; DETAIL="build failed; source rolled back, realm untouched and still running"
+    die "build failed - the realm was never stopped"
+fi
+log "build finished in $(( (SECONDS - build_start) / 60 ))m"
+
+# --------------------------------------------------------------------- backup
+# After the build, immediately before the restart: migrations apply on start,
+# so this is the freshest possible restore point. Nothing below has touched
+# the realm yet, so failing here still costs nothing.
+PHASE=backup
+backup_databases
+log "saving current binaries"
+mkdir -p "$ACORE_BACKUP_DIR"; chmod 700 "$ACORE_BACKUP_DIR"
+BIN_BACKUP="$ACORE_BACKUP_DIR/bin-$STAMP.tar.gz"
+tar -czf "$BIN_BACKUP" -C "$ACORE_PREFIX" bin || die "binary backup failed"
+chmod 600 "$BIN_BACKUP"
+
+# -------------------------------------------------------------------- install
+PHASE=install
+log "stopping realm"
+svc_stop
+if ! as_srv cmake --install "$ACORE_BUILD" >/dev/null; then
+    log "install failed - restoring previous binaries"
+    tar -xzf "$BIN_BACKUP" -C "$ACORE_PREFIX"
+    svc_start; rollback_source
+    RESULT=failed; DETAIL="install failed; previous binaries restored"
+    if wait_healthy; then exit 1; else exit 2; fi
+fi
+log "starting realm (SQL migrations apply automatically on worldserver start)"
+svc_start
+
+# --------------------------------------------------------------------- verify
+PHASE=verify
+if wait_healthy; then
+    RESULT=success; DETAIL="updated and healthy: $summary"
+    log "realm healthy after update"
+    printf '%s\n' "$PATCH_HASH" > "$PATCH_HASH_FILE"
+    ls -1t "$ACORE_BACKUP_DIR"/bin-*.tar.gz 2>/dev/null | tail -n +$((ACORE_BACKUP_KEEP+1)) | xargs -r rm -f
+    exit 0
+fi
+
+# ------------------------------------------------------------------- rollback
+PHASE=rollback
+log "realm did NOT come back healthy - rolling back"
+svc_stop || true
+tar -xzf "$BIN_BACKUP" -C "$ACORE_PREFIX"
+rollback_source
+svc_start
+if wait_healthy; then
+    RESULT=rolledback
+    # The database is deliberately NOT restored. Migrations are additive in
+    # almost every case and an older binary tolerates a newer schema, whereas
+    # restoring a dump discards every character change since it was taken.
+    # Trading real player progress for a usually-cosmetic mismatch is worse,
+    # so that call is left to a human.
+    DETAIL="update failed; binaries and source rolled back, realm healthy again. DB migrations were NOT reverted - dumps are in $ACORE_BACKUP_DIR if needed."
+    log "$DETAIL"; exit 1
+fi
+RESULT=down
+DETAIL="update failed AND rollback failed - realm is DOWN. Binary backup: $BIN_BACKUP"
+log "$DETAIL"; exit 2

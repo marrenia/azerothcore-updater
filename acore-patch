@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+#
+# acore-patch - manage a local patch series carried on top of upstream
+#               AzerothCore and its modules.
+#
+# Patches live outside every git tree, in $ACORE_PATCH_DIR/<repo>/NNNN-*.patch,
+# and are re-applied by acore-update on each run on top of a pristine checkout.
+# They are applied with `git apply` into the working tree, never committed, so
+# HEAD stays byte-identical to upstream and `git merge --ff-only` keeps working
+# forever. That is the whole point: you can carry local changes without ever
+# blocking updates.
+#
+# Typical loop:
+#     acore-patch edit mod-playerbots        # pristine upstream + your series
+#     ...edit files...
+#     acore-patch create mod-playerbots fix-thing
+#     acore-patch check                      # do they all still apply?
+#     acore-update --force                   # rebuild and deploy
+#
+set -Eeuo pipefail
+SELF="$(basename "$0")"
+
+CONF="${ACORE_UPDATE_CONF:-}"
+if [[ -z "$CONF" ]]; then
+    for c in /etc/acore-update.conf /usr/local/etc/acore-update.conf \
+             "$(dirname "$(readlink -f "$0")")/acore-update.conf"; do
+        [[ -r "$c" ]] && { CONF="$c"; break; }
+    done
+fi
+# shellcheck disable=SC1090
+[[ -n "$CONF" && -r "$CONF" ]] && . "$CONF"
+
+die() { echo "$SELF: $*" >&2; exit 1; }
+
+detect_src() {
+    local c
+    for c in "${ACORE_SRC:-}" /home/*/azerothcore /home/*/azerothcore-wotlk \
+             /opt/azerothcore /opt/azerothcore-wotlk /srv/azerothcore "$PWD"; do
+        [[ -n "$c" && -d "$c/.git" && -f "$c/CMakeLists.txt" && -d "$c/src/server" ]] \
+            && { readlink -f "$c"; return 0; }
+    done
+    return 1
+}
+ACORE_SRC="${ACORE_SRC:-$(detect_src || true)}"
+[[ -n "$ACORE_SRC" ]] || die "cannot find the AzerothCore source tree - set ACORE_SRC in ${CONF:-/etc/acore-update.conf}"
+ACORE_USER="${ACORE_USER:-$(stat -c %U "$ACORE_SRC")}"
+ACORE_PATCH_DIR="${ACORE_PATCH_DIR:-/etc/acore-update/patches}"
+
+[[ $EUID -eq 0 ]] || die "must run as root (writes to $ACORE_PATCH_DIR and the source tree)"
+
+as_srv() {
+    runuser -u "$ACORE_USER" -- env HOME="$(getent passwd "$ACORE_USER" | cut -d: -f6)" "$@"
+}
+
+# Repos are discovered, not configured: core plus any module with its own .git.
+repo_path() {
+    case "$1" in
+        core|azerothcore) echo "$ACORE_SRC" ;;
+        *) [[ -d "$ACORE_SRC/modules/$1/.git" ]] || die "no such module repo: $1 (try '$SELF list')"
+           echo "$ACORE_SRC/modules/$1" ;;
+    esac
+}
+all_keys() {
+    echo core
+    local d; for d in "$ACORE_SRC"/modules/*/; do [[ -d "$d/.git" ]] && basename "$d"; done
+}
+series_of() {
+    local d="$ACORE_PATCH_DIR/$1"
+    [[ -d "$d" ]] || return 0
+    find "$d" -maxdepth 1 -name '*.patch' -type f 2>/dev/null | sort
+}
+apply_series() {
+    local key="$1" path="$2" n=0 p
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        as_srv git -C "$path" apply "$p" || die "failed to apply $(basename "$p")"
+        n=$((n+1))
+    done < <(series_of "$key")
+    echo "$n"
+}
+
+mkdir -p "$ACORE_PATCH_DIR"
+while read -r k; do mkdir -p "$ACORE_PATCH_DIR/$k"; done < <(all_keys)
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+
+list)
+    while read -r k; do
+        echo "== $k"
+        s="$(series_of "$k")"
+        [[ -n "$s" ]] && sed 's|.*/|   |' <<<"$s" || echo "   (none)"
+    done < <(all_keys)
+    ;;
+
+edit)
+    key="${1:?usage: $SELF edit <repo>}"; path="$(repo_path "$key")"
+    as_srv git -C "$path" reset --hard --quiet HEAD
+    as_srv git -C "$path" clean -fdq
+    n="$(apply_series "$key" "$path")"
+    echo "$path is at upstream HEAD with $n existing patch(es) applied."
+    echo "Edit freely, then: $SELF create $key <short-name>"
+    ;;
+
+create)
+    key="${1:?usage: $SELF create <repo> <short-name>}"
+    name="${2:?usage: $SELF create <repo> <short-name>}"
+    path="$(repo_path "$key")"
+
+    as_srv git -C "$path" diff --quiet && die "no changes in $path - nothing to capture"
+
+    # Store only the NEW delta: reverse the existing series out first, so the
+    # patch does not duplicate changes that earlier patches already make.
+    for existing in $(series_of "$key"); do
+        as_srv git -C "$path" apply --reverse --check "$existing" 2>/dev/null \
+            && as_srv git -C "$path" apply --reverse "$existing"
+    done
+    tmp="$(mktemp)"
+    as_srv git -C "$path" diff --binary > "$tmp"
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; die "new changes are already covered by the existing series"; }
+
+    next=$(printf '%04d' $(( $(series_of "$key" | wc -l) + 1 )))
+    out="$ACORE_PATCH_DIR/$key/${next}-${name}.patch"
+    mv "$tmp" "$out"; chmod 644 "$out"
+    echo "wrote $out ($(wc -l < "$out") lines)"
+
+    as_srv git -C "$path" reset --hard --quiet HEAD
+    apply_series "$key" "$path" >/dev/null
+    echo "series re-applied to the working tree."
+    ;;
+
+check)
+    rc=0
+    while read -r k; do
+        s="$(series_of "$k")"; [[ -n "$s" ]] || continue
+        path="$(repo_path "$k")"
+        as_srv git -C "$path" reset --hard --quiet HEAD
+        as_srv git -C "$path" clean -fdq
+        while IFS= read -r p; do
+            if as_srv git -C "$path" apply --check "$p" 2>/dev/null; then
+                echo "ok      $k/$(basename "$p")"
+                as_srv git -C "$path" apply "$p"
+            else
+                echo "FAILS   $k/$(basename "$p")  <-- upstream changed this code"
+                rc=1
+            fi
+        done <<< "$s"
+    done < <(all_keys)
+    exit $rc
+    ;;
+
+remove)
+    key="${1:?usage: $SELF remove <repo> <patch-filename>}"
+    file="${2:?usage: $SELF remove <repo> <patch-filename>}"
+    target="$ACORE_PATCH_DIR/$key/$file"
+    [[ -f "$target" ]] || die "no such patch: $target"
+    mv "$target" "$target.disabled"
+    echo "disabled: $target.disabled (only *.patch files are applied)"
+    echo "run 'acore-update --force' to rebuild without it"
+    ;;
+
+*)
+    cat <<EOF
+$SELF - manage local patches carried on top of upstream AzerothCore
+
+  $SELF list                      show the series for every repo
+  $SELF edit   <repo>             reset to upstream + apply series, ready to hack
+  $SELF create <repo> <name>      capture your new changes as the next patch
+  $SELF check                     verify every patch still applies
+  $SELF remove <repo> <file>      disable a patch (renames to .disabled)
+
+Repos are discovered automatically: 'core' plus each module directory that is
+its own git checkout. Run '$SELF list' to see them.
+EOF
+    ;;
+esac
