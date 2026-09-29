@@ -27,7 +27,7 @@
 #
 set -Eeuo pipefail
 
-VERSION=1.0.0
+VERSION=1.1.0
 SELF="$(basename "$0")"
 
 # --------------------------------------------------------------- config load
@@ -131,6 +131,11 @@ ACORE_BACKUP_DB="${ACORE_BACKUP_DB:-1}"
 ACORE_BACKUP_KEEP="${ACORE_BACKUP_KEEP:-5}"
 ACORE_CMAKE_ARGS="${ACORE_CMAKE_ARGS:-}"
 ACORE_USE_CCACHE="${ACORE_USE_CCACHE:-auto}"
+# Failure reports: plain-text files left in a directory a human will look at.
+# install.sh records the home directory of whoever ran it. Unset = no reports.
+ACORE_REPORT_DIR="${ACORE_REPORT_DIR:-}"
+ACORE_REPORT_OWNER="${ACORE_REPORT_OWNER:-root}"
+ACORE_REPORT_KEEP="${ACORE_REPORT_KEEP:-10}"
 
 DRY_RUN="${ACORE_UPDATE_DRY_RUN:-0}"
 FORCE="${ACORE_UPDATE_FORCE:-0}"
@@ -138,6 +143,8 @@ FORCE="${ACORE_UPDATE_FORCE:-0}"
 STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
 STATUS_FILE="$ACORE_STATE_DIR/last-run.json"
 PATCH_HASH_FILE="$ACORE_STATE_DIR/last-patchset.sha256"
+MODULESET_HASH_FILE="$ACORE_STATE_DIR/last-moduleset.sha256"
+BUILD_LOG="$ACORE_STATE_DIR/build-last.log"
 PATCHES_APPLIED=0
 PHASE=start; RESULT=unknown; DETAIL=""; UPDATED=""
 
@@ -164,6 +171,76 @@ discover_repos() {
 }
 repo_branch() { as_srv git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null; }
 repo_key()    { [[ "$1" == "$ACORE_SRC" ]] && echo core || basename "$1"; }
+
+# ------------------------------------------------------------ failure reports
+# A failed run leaves a readable text file in ACORE_REPORT_DIR - by default the
+# home directory of whoever ran install.sh - so finding out that a night went
+# wrong needs no mail server, chat bot or webhook. One file per failure, named
+# by timestamp; the newest ACORE_REPORT_KEEP are kept.
+report_body() {  # report_body <title>
+    echo "$1"
+    echo
+    echo "result        : $RESULT"
+    echo "failed during : $PHASE"
+    echo "host          : $(hostname 2>/dev/null || cat /proc/sys/kernel/hostname)"
+    echo "finished      : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "realm healthy : $(healthy && echo yes || echo 'NO - needs attention')"
+    echo "changes       : ${UPDATED:-none recorded}"
+    echo
+    echo "what happened:"
+    printf '  %s\n' "${DETAIL:-no detail recorded}"
+    if [[ "$PHASE" == build && -s "$BUILD_LOG" ]]; then
+        echo
+        echo "first compiler errors:"
+        grep -m10 -E 'error:|Killed signal|Error [0-9]+' "$BUILD_LOG" | sed 's/^/  /' \
+            || echo "  (none matched - read the full log)"
+        echo
+        echo "last 60 lines of the build log:"
+        tail -n 60 "$BUILD_LOG" | sed 's/^/  /'
+    fi
+    echo
+    echo "files:"
+    echo "  full build log : $BUILD_LOG"
+    echo "  status (JSON)  : $STATUS_FILE"
+    echo "  backups        : $ACORE_BACKUP_DIR"
+    echo
+    case "$RESULT" in
+        down)
+            echo "THE REALM IS DOWN and the automatic rollback did not bring it back."
+            echo "The previous binaries are in $ACORE_BACKUP_DIR/bin-$STAMP.tar.gz." ;;
+        rolledback)
+            echo "The update was rolled back and the realm is running the previous binaries."
+            echo "Database migrations were NOT reverted; dumps are in $ACORE_BACKUP_DIR." ;;
+        *)
+            echo "The realm was not stopped for this failure and is still running." ;;
+    esac
+    echo "After fixing the cause: sudo $SELF --dry-run, then sudo $SELF"
+}
+
+write_report() {  # write_report <FAILED|TEST> <title>
+    [[ -n "$ACORE_REPORT_DIR" ]] || return 0
+    local dest="$ACORE_REPORT_DIR/acore-update-$1-$STAMP.txt" tmp
+    tmp="$(mktemp)" || { warn "cannot create a temp file for the report"; return 0; }
+    report_body "$2" > "$tmp"
+    # Written AS the report's owner, never as root: root writing into a
+    # user-controlled directory can be redirected onto any file by a planted
+    # symlink. Running as the owner means it can only touch what they could.
+    if [[ "$ACORE_REPORT_OWNER" == root ]]; then
+        (umask 077; cat "$tmp" > "$dest") || warn "could not write $dest"
+    elif id -u "$ACORE_REPORT_OWNER" >/dev/null 2>&1; then
+        runuser -u "$ACORE_REPORT_OWNER" -- sh -c 'umask 077; cat > "$1"' _ "$dest" < "$tmp" \
+            || warn "could not write $dest as $ACORE_REPORT_OWNER"
+        runuser -u "$ACORE_REPORT_OWNER" -- sh -c \
+            'ls -1t "$1"/acore-update-FAILED-*.txt 2>/dev/null | tail -n +"$2" | xargs -r rm -f' \
+            _ "$ACORE_REPORT_DIR" "$((ACORE_REPORT_KEEP + 1))" || true
+    else
+        warn "ACORE_REPORT_OWNER '$ACORE_REPORT_OWNER' does not exist - no report written"
+        rm -f "$tmp"; return 0
+    fi
+    rm -f "$tmp"
+    [[ -f "$dest" ]] && log "report written to $dest"
+    return 0
+}
 
 # -------------------------------------------------------------------- service
 svc_stop() {
@@ -286,6 +363,7 @@ $SELF $VERSION - detected configuration
   patch dir       : $ACORE_PATCH_DIR
   backup dir      : $ACORE_BACKUP_DIR  (db backup: $ACORE_BACKUP_DB)
   state dir       : $ACORE_STATE_DIR
+  failure reports : ${ACORE_REPORT_DIR:-<disabled>}${ACORE_REPORT_DIR:+  (written as $ACORE_REPORT_OWNER)}
 
 repositories discovered:
 EOF
@@ -304,6 +382,7 @@ $SELF $VERSION - unattended AzerothCore updater
   $SELF --force      rebuild even if nothing changed
   $SELF --dry-run    report what would happen, change nothing
   $SELF detect       show detected paths, repos and health, then exit
+  $SELF test-report  write a sample failure report, to check where they land
   $SELF --version
 
 Configuration is optional; see acore-update.conf.example. Everything that can
@@ -313,6 +392,11 @@ EOF
 
 case "${1:-}" in
     detect)            cmd_detect; exit 0 ;;
+    test-report)
+        [[ -n "$ACORE_REPORT_DIR" ]] || die "ACORE_REPORT_DIR is not set - failure reports are disabled"
+        RESULT=test; PHASE=test-report
+        DETAIL="This is a test report from '$SELF test-report'. Nothing failed. Delete this file."
+        write_report TEST "acore-update $VERSION: TEST report"; exit 0 ;;
     -h|--help|help)    cmd_help;   exit 0 ;;
     --version)         echo "$VERSION"; exit 0 ;;
     --dry-run)         DRY_RUN=1 ;;
@@ -324,7 +408,7 @@ esac
 # ------------------------------------------------------------------- plumbing
 write_status() {
     mkdir -p "$ACORE_STATE_DIR"
-    local esc; esc="$(printf '%s' "${DETAIL:-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')"
+    local esc; esc="$(printf '%s' "${DETAIL:-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n\t\r' '   ')"
     cat > "$STATUS_FILE" <<EOF
 {
   "stamp": "$STAMP",
@@ -343,6 +427,10 @@ on_exit() {
     local rc=$?
     [[ "$RESULT" == unknown ]] && RESULT=$([[ $rc -eq 0 ]] && echo success || echo failed)
     write_status || true
+    case "$RESULT" in
+        failed|rolledback|down) [[ "$DRY_RUN" == 1 ]] || write_report FAILED \
+            "acore-update $VERSION: run $STAMP FAILED ($RESULT during $PHASE)" || true ;;
+    esac
     log "done (result=$RESULT phase=$PHASE rc=$rc)"
 }
 trap on_exit EXIT
@@ -409,6 +497,25 @@ if [[ "$PATCH_HASH" != "$LAST_PATCH_HASH" ]]; then
     log "patch set changed (${LAST_PATCH_HASH:0:12} -> ${PATCH_HASH:0:12})"
     summary+="patchset ${LAST_PATCH_HASH:0:9}->${PATCH_HASH:0:9}; "; changed=1
 fi
+# Same for the module SET. Modules are auto-discovered, but a freshly cloned
+# one is already at its upstream head, so the per-repo check above sees
+# nothing new and it would never be compiled in. Hash the discovered list.
+MODULESET_HASH="$(for p in "${REPOS[@]}"; do printf '%s %s\n' "$(repo_key "$p")" "$(repo_branch "$p")"; done \
+                  | sort | sha256sum | cut -d' ' -f1)"
+if [[ ! -f "$MODULESET_HASH_FILE" ]]; then
+    # First run of a version that tracks this. Record a baseline rather than
+    # rebuilding, so upgrading acore-update itself never causes a surprise
+    # rebuild and restart. (Added a module just before upgrading? --force.)
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "would record module-set baseline (${MODULESET_HASH:0:12})"
+    else
+        printf '%s\n' "$MODULESET_HASH" > "$MODULESET_HASH_FILE"
+        log "recorded module-set baseline (${MODULESET_HASH:0:12})"
+    fi
+elif [[ "$MODULESET_HASH" != "$(cat "$MODULESET_HASH_FILE")" ]]; then
+    log "module set changed ($(cut -c1-12 "$MODULESET_HASH_FILE") -> ${MODULESET_HASH:0:12})"
+    summary+="moduleset changed; "; changed=1
+fi
 if (( FORCE )) && (( ! changed )); then
     log "nothing changed, but --force given"; summary+="forced; "; changed=1
 fi
@@ -468,9 +575,14 @@ run_build() {
             env HOME="$SRV_HOME" cmake --build "$ACORE_BUILD" -- -j"$ACORE_JOBS"
     fi
 }
-if ! run_build; then
+# Output still goes to the terminal/journal as before, and also to a file, so
+# a failure's compiler errors survive for the status file and the report.
+[[ -f "$BUILD_LOG" ]] && mv -f "$BUILD_LOG" "$BUILD_LOG.1"
+if ! run_build 2>&1 | tee "$BUILD_LOG"; then
     rollback_source
-    RESULT=failed; DETAIL="build failed; source rolled back, realm untouched and still running"
+    first_err="$(grep -m3 -E 'error:|Killed signal|Error [0-9]+' "$BUILD_LOG" | cut -c1-220 | paste -sd'|' || true)"
+    RESULT=failed
+    DETAIL="build failed; source rolled back, realm untouched and still running. First errors: ${first_err:-none captured, see $BUILD_LOG}"
     die "build failed - the realm was never stopped"
 fi
 log "build finished in $(( (SECONDS - build_start) / 60 ))m"
@@ -507,6 +619,7 @@ if wait_healthy; then
     RESULT=success; DETAIL="updated and healthy: $summary"
     log "realm healthy after update"
     printf '%s\n' "$PATCH_HASH" > "$PATCH_HASH_FILE"
+    printf '%s\n' "$MODULESET_HASH" > "$MODULESET_HASH_FILE"
     ls -1t "$ACORE_BACKUP_DIR"/bin-*.tar.gz 2>/dev/null | tail -n +$((ACORE_BACKUP_KEEP+1)) | xargs -r rm -f
     exit 0
 fi

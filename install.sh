@@ -18,6 +18,27 @@ else
     echo "wrote /etc/acore-update.conf (all values commented out - detection does the work)"
 fi
 
+# Failed runs leave a text report in the home directory of whoever installed
+# this. Under sudo that is SUDO_USER; logged in as root, it is root. Recorded
+# now because the nightly timer runs as root and cannot know who you are.
+INSTALL_USER="${SUDO_USER:-root}"
+INSTALL_HOME="$(getent passwd "$INSTALL_USER" | cut -d: -f6)"
+if grep -qE '^[[:space:]]*ACORE_REPORT_DIR=' /etc/acore-update.conf; then
+    echo "kept existing failure-report setting in /etc/acore-update.conf"
+elif [[ -n "$INSTALL_HOME" && -d "$INSTALL_HOME" ]]; then
+    {
+        echo
+        echo "# Recorded by install.sh on $(date -u +%Y-%m-%d): failed runs write"
+        echo "# acore-update-FAILED-<time>.txt here, as this user."
+        printf 'ACORE_REPORT_DIR=%q\n' "$INSTALL_HOME"
+        printf 'ACORE_REPORT_OWNER=%q\n' "$INSTALL_USER"
+    } >> /etc/acore-update.conf
+    echo "failure reports will be written to $INSTALL_HOME (as $INSTALL_USER)"
+else
+    echo "could not find a home directory for '$INSTALL_USER' - failure reports stay off;"
+    echo "set ACORE_REPORT_DIR / ACORE_REPORT_OWNER in /etc/acore-update.conf to enable them"
+fi
+
 echo
 echo "Checking what it detects on this host:"
 echo
@@ -29,6 +50,8 @@ echo
 echo
 echo "Looks right? Try a dry run, which changes nothing:"
 echo "    sudo acore-update --dry-run"
+echo "and check where failure reports will land:"
+echo "    sudo acore-update test-report"
 echo
 if [[ -d /run/systemd/system ]]; then
     read -r -p "Install the daily 05:30 systemd timer? [y/N] " a

@@ -65,3 +65,15 @@
 #ACORE_BACKUP_KEEP=5
 #ACORE_PATCH_DIR=/etc/acore-update/patches
 #ACORE_STATE_DIR=/var/lib/acore-update
+
+# ---- failure reports -------------------------------------------------------
+# A failed run writes acore-update-FAILED-<time>.txt here: what failed, the
+# first compiler errors and the tail of the build log for build failures, and
+# whether the realm is still up. install.sh sets these to the home directory of
+# the user who ran it. Unset ACORE_REPORT_DIR to turn reports off.
+# Check it works with: sudo acore-update test-report
+#ACORE_REPORT_DIR=/home/you
+# The file is written as this user (never as root into their directory).
+#ACORE_REPORT_OWNER=you
+# How many failure reports to keep; older ones are deleted.
+#ACORE_REPORT_KEEP=10

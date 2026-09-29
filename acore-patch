@@ -56,7 +56,10 @@ as_srv() {
 repo_path() {
     case "$1" in
         core|azerothcore) echo "$ACORE_SRC" ;;
-        *) [[ -d "$ACORE_SRC/modules/$1/.git" ]] || die "no such module repo: $1 (try '$SELF list')"
+        # A plain directory name only: ".." would otherwise pass (modules/../.git
+        # is the core repo) and send patches outside the patch directory.
+        *) [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || die "invalid repo name: $1"
+           [[ -d "$ACORE_SRC/modules/$1/.git" ]] || die "no such module repo: $1 (try '$SELF list')"
            echo "$ACORE_SRC/modules/$1" ;;
     esac
 }

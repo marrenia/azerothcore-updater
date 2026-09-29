@@ -17,6 +17,7 @@ $ sudo acore-update detect
   runs as user    : acore
   world service   : acore-worldserver
   health probe    : <tcp 127.0.0.1:8085>
+  failure reports : /home/you  (written as you)
 
 repositories discovered:
   core               Playerbot    /home/acore/azerothcore
@@ -34,9 +35,11 @@ an AI assistant, reviewed, and exercised against exactly one server layout
 (Ubuntu, systemd, MySQL, playerbots fork, out-of-the-box paths).
 
 The logic is defensive and every failure path was reasoned through, but only
-some have actually fired for real — the patch-no-longer-applies path has, and
-aborted the run cleanly with the realm untouched. A full
-restore-from-rollback has not.
+some have actually fired for real. The patch-no-longer-applies path has, and
+aborted the run cleanly with the realm untouched. So has a build failure: a
+newly added module that did not compile on the playerbots fork, which rolled
+the source back without ever stopping the realm. A full restore-from-rollback
+has not.
 
 If your realm matters, read the script before you run it, and try
 `--dry-run` first. It is about 500 lines of readable bash with comments
@@ -51,14 +54,16 @@ sudo ./install.sh
 ```
 
 The installer copies two scripts to `/usr/local/sbin`, creates
-`/etc/acore-update.conf` with everything commented out, runs `detect` so you
-can see what it found, and offers a daily systemd timer.
+`/etc/acore-update.conf` with everything commented out, records **your** home
+directory as the place failure reports go (see [When a run fails](#when-a-run-fails)),
+runs `detect` so you can see what it found, and offers a daily systemd timer.
 
 Then, before trusting it:
 
 ```bash
-sudo acore-update detect      # is this your server?
-sudo acore-update --dry-run   # what would it do?
+sudo acore-update detect        # is this your server?
+sudo acore-update --dry-run     # what would it do?
+sudo acore-update test-report   # where would you hear about a failure?
 ```
 
 ## What it detects, and how
@@ -173,7 +178,51 @@ crashes, so a monitor never mistakes a stale success for a current one:
 ```
 
 `result` is one of `noop`, `success`, `failed`, `rolledback`, `down`,
-`skipped`, `dryrun`.
+`skipped`, `dryrun`. For a build failure, `detail` includes the first compiler
+errors.
+
+## When a run fails
+
+A failed, rolled-back or realm-down run leaves a plain-text report in the home
+directory of whoever installed acore-update, so finding out needs no mail
+server, chat bot or webhook - just `ls ~`:
+
+```
+~/acore-update-FAILED-2026-09-29T16-49-33Z.txt
+```
+
+It says what failed and when, whether the realm is still up, and what changed.
+For a **build** failure it also includes the first compiler errors and the last
+60 lines of the build log. One file per failure; the newest 10 are kept
+(`ACORE_REPORT_KEEP`).
+
+- `install.sh` records `SUDO_USER` and their home directory in
+  `/etc/acore-update.conf` as `ACORE_REPORT_DIR` / `ACORE_REPORT_OWNER`.
+  The nightly timer runs as root and would otherwise have no idea who you are.
+  Change either, or unset `ACORE_REPORT_DIR` to turn reports off.
+- The file is written **as that user**, never as root. Root writing into a
+  directory another user controls can be redirected onto any file on the
+  system by a symlink planted at the report's path; writing as the owner means
+  it can only ever touch what they could.
+- `sudo acore-update test-report` writes a clearly labelled sample, so you can
+  confirm where reports land without waiting for something to break.
+
+The full output of the most recent build is kept in
+`/var/lib/acore-update/build-last.log` (the one before as `.1`), whether it
+succeeded or not.
+
+## Adding and removing modules
+
+Modules are discovered, not configured: clone one into `modules/` and the next
+run tracks it. Changing the **set** of modules triggers a rebuild on its own,
+even if no repository has new commits. A freshly cloned module is already at
+its upstream head, so without this it would be tracked forever and never
+compiled in.
+
+The first run after upgrading to a version with this behaviour records the
+current set as a baseline instead of rebuilding, so upgrading acore-update
+never costs you a surprise restart. If you added a module just before
+upgrading, run `sudo acore-update --force` once.
 
 ## Requirements
 
@@ -192,6 +241,17 @@ detection.
   while the build still succeeds.
 - **The cmake variable is `TOOLS_BUILD`, not `TOOLS`.** `-DTOOLS=0` is accepted
   and ignored.
+- **A new module is never built.** Each repository is checked for new upstream
+  commits, and a module you just cloned has none - so it sat on disk, tracked
+  and uncompiled. Now the module set itself is a rebuild trigger.
+- **Compiler errors went missing.** A real build failure left no compiler error
+  in the journal at all; the cause had to be found by hand-compiling objects
+  one by one. We never pinned down why. Build output is now also written to a
+  file, and the first errors are copied into the status file and the report.
+- **Module compatibility with the playerbots fork.** Some modules call
+  `WorldSession::IsHeadless()`, which upstream AzerothCore added and the
+  playerbots fork still names `IsBot()`. They fail to compile there. Carry a
+  small compatibility patch (see *Local patches*) until the fork catches up.
 
 ## Licence
 
