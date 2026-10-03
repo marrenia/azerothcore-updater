@@ -27,7 +27,7 @@
 #
 set -Eeuo pipefail
 
-VERSION=1.1.0
+VERSION=1.1.1
 SELF="$(basename "$0")"
 
 # --------------------------------------------------------------- config load
@@ -331,12 +331,25 @@ clean_tree() { as_srv git -C "$1" reset --hard --quiet HEAD; as_srv git -C "$1" 
 apply_patches() {
     local path="$1" list applied=0; list="$(patches_for "$path")"
     [[ -n "$list" ]] || return 0
+    # The fast-forward has already happened by the patch phase. Roll the source
+    # back before dying: left on the new upstream commits, the NEXT run sees
+    # "up to date", reports noop, and the update is silently dropped until
+    # upstream happens to move again. Message first - rollback_source reuses
+    # loop variables, so build DETAIL while $path and $p are still ours.
+    local p
     while IFS= read -r p; do
-        as_srv git -C "$path" apply --check "$p" \
-            || die "patch no longer applies to $(repo_key "$path"): $(basename "$p") - upstream changed that code, rebase it by hand"
+        if ! as_srv git -C "$path" apply --check "$p"; then
+            RESULT=failed
+            DETAIL="patch no longer applies to $(repo_key "$path"): $(basename "$p") - upstream changed that code. Source rolled back so the next run retries; realm untouched. Rebase the patch (acore-patch), then run acore-update."
+            rollback_source; die "$DETAIL"
+        fi
     done <<< "$list"
     while IFS= read -r p; do
-        as_srv git -C "$path" apply "$p" || die "patch failed mid-series: $(basename "$p")"
+        if ! as_srv git -C "$path" apply "$p"; then
+            RESULT=failed
+            DETAIL="patch failed mid-series on $(repo_key "$path"): $(basename "$p"). Source rolled back; realm untouched."
+            rollback_source; die "$DETAIL"
+        fi
         applied=$((applied+1))
     done <<< "$list"
     log "$(repo_key "$path"): applied $applied patch(es)"
@@ -526,6 +539,7 @@ if [[ "$DRY_RUN" == 1 ]]; then RESULT=dryrun; DETAIL="$summary"; log "DRY RUN - 
 # --------------------------------------------------------------------- source
 PHASE=source
 rollback_source() {
+    local p   # bash scoping is dynamic: without this, callers' $p is overwritten
     for p in "${REPOS[@]}"; do
         [[ -n "${OLD_SHA[$p]:-}" ]] && as_srv git -C "$p" reset --hard "${OLD_SHA[$p]}" --quiet || true
     done
